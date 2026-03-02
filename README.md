@@ -220,8 +220,3 @@ make lint                     # Run all linters
 make test                     # Run full test suite
 ```
 
----
-
-## License
-
-MIT

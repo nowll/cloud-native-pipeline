@@ -1,0 +1,57 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: app-prod
+
+bases:
+  - ../../base
+
+# Production image (set by CI via `kustomize edit set image`)
+images:
+  - name: app
+    newName: ghcr.io/your-org/your-app
+    newTag: latest
+
+# Production-specific patches
+patches:
+  # Scale up replicas
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+      spec:
+        replicas: 5
+    target:
+      kind: Deployment
+      name: app
+
+  # Increase resource limits
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: app
+      spec:
+        template:
+          spec:
+            containers:
+              - name: app
+                resources:
+                  requests:
+                    cpu: 500m
+                    memory: 512Mi
+                  limits:
+                    memory: 1Gi
+    target:
+      kind: Deployment
+      name: app
+
+# Production labels
+commonLabels:
+  environment: production
+  tier: prod
+
+# Production annotations
+commonAnnotations:
+  deployment.kubernetes.io/revision: "1"

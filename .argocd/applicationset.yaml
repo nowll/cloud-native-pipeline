@@ -1,0 +1,107 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: app-environments
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+
+  # ─────────────────────────────────────────────
+  # Matrix generator: app × environment
+  # ─────────────────────────────────────────────
+  generators:
+    - matrix:
+        generators:
+          - list:
+              elements:
+                - environment: dev
+                  namespace: app-dev
+                  cluster: https://kubernetes.default.svc
+                  server: dev-cluster
+                  syncWave: "1"
+                  autoSync: true
+                  prune: true
+                  selfHeal: true
+
+                - environment: staging
+                  namespace: app-staging
+                  cluster: https://staging-eks.example.com
+                  server: staging-cluster
+                  syncWave: "2"
+                  autoSync: false  # Manual promotion required
+                  prune: true
+                  selfHeal: true
+
+                - environment: prod
+                  namespace: app-prod
+                  cluster: https://prod-eks.example.com
+                  server: prod-cluster
+                  syncWave: "3"
+                  autoSync: false  # Manual gate in prod
+                  prune: false     # Never auto-prune prod
+                  selfHeal: true
+
+          - git:
+              repoURL: https://github.com/your-org/your-repo.git
+              revision: HEAD
+              files:
+                - path: "kubernetes/overlays/*/kustomization.yaml"
+
+  # ─────────────────────────────────────────────
+  # Application template
+  # ─────────────────────────────────────────────
+  template:
+    metadata:
+      name: "app-{{ .environment }}"
+      namespace: argocd
+      labels:
+        app.kubernetes.io/name: app
+        environment: "{{ .environment }}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{ .syncWave }}"
+        notifications.argoproj.io/subscribe.on-sync-succeeded.slack: app-deploys
+        notifications.argoproj.io/subscribe.on-sync-failed.slack: app-deploys-critical
+        notifications.argoproj.io/subscribe.on-health-degraded.slack: app-deploys-critical
+
+    spec:
+      project: apps
+
+      source:
+        repoURL: https://github.com/your-org/your-repo.git
+        targetRevision: HEAD
+        path: "kubernetes/overlays/{{ .environment }}"
+
+      destination:
+        server: "{{ .cluster }}"
+        namespace: "{{ .namespace }}"
+
+      syncPolicy:
+        automated:
+          prune: "{{ .prune }}"
+          selfHeal: "{{ .selfHeal }}"
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - PrunePropagationPolicy=foreground
+          - PruneLast=true
+          - ApplyOutOfSyncOnly=true
+          - ServerSideApply=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
+
+      ignoreDifferences:
+        - group: apps
+          kind: Deployment
+          jsonPointers:
+            - /spec/replicas  # Managed by HPA
+        - group: autoscaling
+          kind: HorizontalPodAutoscaler
+          jsonPointers:
+            - /spec/metrics
+
+      revisionHistoryLimit: 10

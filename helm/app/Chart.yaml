@@ -1,0 +1,21 @@
+apiVersion: v2
+name: app
+description: Cloud-native application Helm chart
+type: application
+version: 1.0.0
+appVersion: "latest"
+keywords:
+  - cloud-native
+  - kubernetes
+  - microservices
+maintainers:
+  - name: Platform Engineering
+    email: platform@example.com
+annotations:
+  artifacthub.io/changes: |
+    - kind: added
+      description: "Blue/Green deployment support"
+    - kind: added
+      description: "KEDA event-driven autoscaling"
+    - kind: added
+      description: "OpenTelemetry sidecar integration"

@@ -1,0 +1,49 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform.lock.hcl
+terraform/environments/**/terraform.tfvars
+!terraform/environments/**/terraform.tfvars.example
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Go
+vendor/
+*.exe
+*.dll
+*.so
+*.dylib
+coverage.out
+coverage.html
+
+# Docker
+.dockerignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets — never commit these
+*.pem
+*.key
+*.crt
+secrets.yaml
+*-secret.yaml
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+dist/
+bin/

@@ -1,0 +1,290 @@
+# Default Helm values for the application
+# Override per environment with values.{env}.yaml
+
+replicaCount: 3
+
+image:
+  repository: ghcr.io/your-org/your-app
+  pullPolicy: IfNotPresent
+  tag: ""
+  digest: ""
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ─────────────────────────────────────────────
+# Service Account (IRSA)
+# ─────────────────────────────────────────────
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+
+# ─────────────────────────────────────────────
+# Pod Settings
+# ─────────────────────────────────────────────
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+podLabels:
+  app.kubernetes.io/component: backend
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# ─────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+    # No CPU limits to prevent throttling; rely on VPA + HPA
+
+# ─────────────────────────────────────────────
+# Autoscaling
+# ─────────────────────────────────────────────
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 50
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+# KEDA ScaledObject (event-driven, overrides HPA when enabled)
+keda:
+  enabled: false
+
+# ─────────────────────────────────────────────
+# VPA
+# ─────────────────────────────────────────────
+vpa:
+  enabled: true
+  updateMode: "Auto"
+
+# ─────────────────────────────────────────────
+# Service
+# ─────────────────────────────────────────────
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  metricsPort: 9090
+  enabled: true
+
+# ─────────────────────────────────────────────
+# Ingress
+# ─────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    alb.ingress.kubernetes.io/certificate-arn: ""
+    alb.ingress.kubernetes.io/wafv2-acl-arn: ""
+    alb.ingress.kubernetes.io/load-balancer-attributes: |
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=your-alb-logs,
+      routing.http.drop_invalid_header_fields.enabled=true,
+      routing.http2.enabled=true
+  hosts:
+    - host: app.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+
+# ─────────────────────────────────────────────
+# Probes
+# ─────────────────────────────────────────────
+livenessProbe:
+  httpGet:
+    path: /healthz/live
+    port: 8080
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /healthz/ready
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+startupProbe:
+  httpGet:
+    path: /healthz/startup
+    port: 8080
+  failureThreshold: 30
+  periodSeconds: 10
+
+# ─────────────────────────────────────────────
+# Topology & Scheduling
+# ─────────────────────────────────────────────
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: app
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: app
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+                - app
+        topologyKey: kubernetes.io/hostname
+
+nodeSelector:
+  role: application
+
+tolerations: []
+
+# ─────────────────────────────────────────────
+# Disruption Budget
+# ─────────────────────────────────────────────
+podDisruptionBudget:
+  enabled: true
+  minAvailable: "50%"
+
+# ─────────────────────────────────────────────
+# Network Policy
+# ─────────────────────────────────────────────
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+
+# ─────────────────────────────────────────────
+# Blue/Green slot
+# ─────────────────────────────────────────────
+slot: blue
+canary:
+  enabled: false
+  weight: 0
+
+# ─────────────────────────────────────────────
+# Environment variables
+# ─────────────────────────────────────────────
+env:
+  - name: APP_ENV
+    value: production
+  - name: LOG_LEVEL
+    value: info
+  - name: LOG_FORMAT
+    value: json
+
+envFrom:
+  - secretRef:
+      name: app-secrets
+  - configMapRef:
+      name: app-config
+
+# ─────────────────────────────────────────────
+# External Secrets
+# ─────────────────────────────────────────────
+externalSecrets:
+  enabled: true
+  refreshInterval: 1h
+  secretStore: aws-secrets-manager
+  remoteRefs:
+    DATABASE_URL:
+      remoteRef:
+        key: app/prod/database-url
+    REDIS_URL:
+      remoteRef:
+        key: app/prod/redis-url
+
+# ─────────────────────────────────────────────
+# OpenTelemetry
+# ─────────────────────────────────────────────
+otel:
+  enabled: true
+  endpoint: http://otel-collector.observability.svc.cluster.local:4317
+  propagators: tracecontext,baggage,b3
+
+# ─────────────────────────────────────────────
+# ServiceMonitor (Prometheus)
+# ─────────────────────────────────────────────
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  labels:
+    release: kube-prometheus-stack

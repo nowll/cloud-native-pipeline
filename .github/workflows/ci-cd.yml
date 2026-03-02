@@ -1,0 +1,683 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+      force_deploy:
+        description: "Force deploy (skip canary)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  HELM_VERSION: "3.14.0"
+  KUBECTL_VERSION: "1.29.0"
+  TERRAFORM_VERSION: "1.7.4"
+  GO_VERSION: "1.22"
+  NODE_VERSION: "20"
+
+jobs:
+  # ─────────────────────────────────────────────
+  # STAGE 1: Code Quality & Security
+  # ─────────────────────────────────────────────
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Lint (golangci-lint)
+        uses: golangci/golangci-lint-action@v4
+        with:
+          version: latest
+          args: --timeout=5m --config=.golangci.yml
+
+      - name: Static Analysis (staticcheck)
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
+      - name: Vulnerability Scan (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  sast:
+    name: SAST & Secret Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog Secret Scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
+
+      - name: CodeQL Analysis
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          queries: security-extended
+
+      - name: CodeQL Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: CodeQL Analysis Results
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:go
+
+  # ─────────────────────────────────────────────
+  # STAGE 2: Test
+  # ─────────────────────────────────────────────
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    needs: [quality]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Unit Tests
+        env:
+          DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable
+          REDIS_URL: redis://localhost:6379
+        run: |
+          go test ./... \
+            -v \
+            -race \
+            -coverprofile=coverage.out \
+            -covermode=atomic \
+            -timeout=10m
+
+      - name: Coverage Report
+        run: |
+          go tool cover -func=coverage.out
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "COVERAGE=${COVERAGE}" >> $GITHUB_ENV
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "❌ Coverage ${COVERAGE}% is below 80% threshold"
+            exit 1
+          fi
+          echo "✅ Coverage: ${COVERAGE}%"
+
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Integration Tests
+        env:
+          DATABASE_URL: postgres://testuser:testpass@localhost:5432/testdb?sslmode=disable
+          REDIS_URL: redis://localhost:6379
+          RUN_INTEGRATION: "true"
+        run: go test ./tests/integration/... -v -timeout=15m
+
+  # ─────────────────────────────────────────────
+  # STAGE 3: Build & Push Image
+  # ─────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: [test, sast]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # OIDC for keyless signing
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+          sbom: true
+          provenance: true
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless OIDC)
+        run: |
+          cosign sign --yes \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+
+  # ─────────────────────────────────────────────
+  # STAGE 4: Image Security Scan
+  # ─────────────────────────────────────────────
+  image-scan:
+    name: Image Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: [build]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build.outputs.image_ref }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Grype SBOM Scan
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ needs.build.outputs.image_ref }}
+          fail-build: true
+          severity-cutoff: critical
+
+  # ─────────────────────────────────────────────
+  # STAGE 5: Terraform Plan
+  # ─────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+        exclude:
+          - environment: ${{ github.ref != 'refs/heads/main' && 'prod' || 'none' }}
+          - environment: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/develop' && 'staging' || 'none' }}
+
+    environment: ${{ matrix.environment }}-plan
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', upper(matrix.environment))] }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: terraform-plan-${{ matrix.environment }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform Init
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: terraform init -backend-config="key=${{ matrix.environment }}/terraform.tfstate"
+
+      - name: Terraform Validate
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: terraform/environments/${{ matrix.environment }}
+        run: |
+          terraform plan \
+            -var="image_tag=${{ needs.build.outputs.image_tag }}" \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan.txt
+          echo "exitcode=$?" >> $GITHUB_OUTPUT
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.environment }}
+          path: terraform/environments/${{ matrix.environment }}/tfplan
+          retention-days: 7
+
+      - name: tfsec Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: terraform/
+          soft_fail: false
+
+      - name: Checkov IaC Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          quiet: true
+          soft_fail: false
+
+  # ─────────────────────────────────────────────
+  # STAGE 6: Deploy to Dev
+  # ─────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy → Dev
+    runs-on: ubuntu-latest
+    needs: [build, image-scan, terraform-plan]
+    if: |
+      github.ref == 'refs/heads/develop' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
+    environment:
+      name: dev
+      url: https://app.dev.example.com
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-dev
+          path: terraform/environments/dev/
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Apply (Dev)
+        working-directory: terraform/environments/dev
+        run: terraform apply -auto-approve tfplan
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v${{ env.KUBECTL_VERSION }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_DEV }} --region ${{ vars.AWS_REGION }}
+
+      - name: Helm upgrade (Dev)
+        run: |
+          helm upgrade --install app ./helm/app \
+            --namespace app-dev \
+            --create-namespace \
+            --values helm/app/values.yaml \
+            --values helm/app/values.dev.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --set image.digest=${{ needs.build.outputs.image_digest }} \
+            --atomic \
+            --timeout=10m \
+            --wait
+
+      - name: Smoke Tests (Dev)
+        run: |
+          ./scripts/smoke-tests.sh \
+            --url=https://app.dev.example.com \
+            --timeout=300
+
+  # ─────────────────────────────────────────────
+  # STAGE 7: Deploy to Staging (Canary)
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging (Canary)
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://app.staging.example.com
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Setup tooling
+        run: |
+          # kubectl
+          curl -LO "https://dl.k8s.io/release/v${{ env.KUBECTL_VERSION }}/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          # helm
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | DESIRED_VERSION=v${{ env.HELM_VERSION }} bash
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_STAGING }} --region ${{ vars.AWS_REGION }}
+
+      - name: Canary Deploy (10%)
+        run: |
+          helm upgrade --install app-canary ./helm/app \
+            --namespace app-staging \
+            --values helm/app/values.yaml \
+            --values helm/app/values.staging.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --set canary.enabled=true \
+            --set canary.weight=10 \
+            --atomic \
+            --timeout=10m
+
+      - name: Monitor Canary (10 min)
+        run: |
+          ./scripts/monitor-canary.sh \
+            --namespace=app-staging \
+            --release=app-canary \
+            --duration=600 \
+            --error-threshold=1 \
+            --latency-p99=500
+
+      - name: Promote Canary (50%)
+        run: |
+          helm upgrade app-canary ./helm/app \
+            --namespace app-staging \
+            --reuse-values \
+            --set canary.weight=50
+
+      - name: Monitor Canary (10 min)
+        run: |
+          ./scripts/monitor-canary.sh \
+            --namespace=app-staging \
+            --release=app-canary \
+            --duration=600 \
+            --error-threshold=1 \
+            --latency-p99=500
+
+      - name: Full rollout (100%)
+        run: |
+          helm upgrade --install app ./helm/app \
+            --namespace app-staging \
+            --values helm/app/values.yaml \
+            --values helm/app/values.staging.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --atomic \
+            --timeout=10m
+          # Remove canary
+          helm uninstall app-canary --namespace app-staging || true
+
+      - name: E2E Tests (Staging)
+        run: |
+          ./scripts/e2e-tests.sh \
+            --url=https://app.staging.example.com \
+            --suite=full \
+            --timeout=600
+
+  # ─────────────────────────────────────────────
+  # STAGE 8: Deploy to Production (Blue/Green)
+  # ─────────────────────────────────────────────
+  deploy-prod:
+    name: Deploy → Production (Blue/Green)
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://app.example.com
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_PROD }} --region ${{ vars.AWS_REGION }}
+
+      - name: Determine active slot (blue/green)
+        id: slot
+        run: |
+          ACTIVE=$(kubectl get service app -n app-prod -o jsonpath='{.spec.selector.slot}' 2>/dev/null || echo "blue")
+          if [ "$ACTIVE" = "blue" ]; then
+            echo "deploy_slot=green" >> $GITHUB_OUTPUT
+            echo "active_slot=blue" >> $GITHUB_OUTPUT
+          else
+            echo "deploy_slot=blue" >> $GITHUB_OUTPUT
+            echo "active_slot=green" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to inactive slot (${{ steps.slot.outputs.deploy_slot }})
+        run: |
+          helm upgrade --install app-${{ steps.slot.outputs.deploy_slot }} ./helm/app \
+            --namespace app-prod \
+            --create-namespace \
+            --values helm/app/values.yaml \
+            --values helm/app/values.prod.yaml \
+            --set image.tag=${{ needs.build.outputs.image_tag }} \
+            --set slot=${{ steps.slot.outputs.deploy_slot }} \
+            --set service.enabled=false \
+            --atomic \
+            --timeout=15m
+
+      - name: Health check (${{ steps.slot.outputs.deploy_slot }})
+        run: |
+          ./scripts/health-check.sh \
+            --slot=${{ steps.slot.outputs.deploy_slot }} \
+            --namespace=app-prod \
+            --timeout=300
+
+      - name: Switch traffic to ${{ steps.slot.outputs.deploy_slot }}
+        run: |
+          kubectl patch service app -n app-prod \
+            --type=json \
+            -p='[{"op":"replace","path":"/spec/selector/slot","value":"${{ steps.slot.outputs.deploy_slot }}"}]'
+          echo "✅ Traffic switched to ${{ steps.slot.outputs.deploy_slot }}"
+
+      - name: Post-switch validation (5 min)
+        run: |
+          ./scripts/monitor-canary.sh \
+            --namespace=app-prod \
+            --release=app-${{ steps.slot.outputs.deploy_slot }} \
+            --duration=300 \
+            --error-threshold=0.5 \
+            --latency-p99=300
+
+      - name: Scale down old slot (${{ steps.slot.outputs.active_slot }})
+        run: |
+          kubectl scale deployment app-${{ steps.slot.outputs.active_slot }} \
+            --replicas=1 \
+            -n app-prod
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          generate_release_notes: true
+          make_latest: true
+
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} Production deploy ${{ job.status }}: `${{ needs.build.outputs.image_tag }}`",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*${{ job.status == 'success' && '✅ Deployed' || '❌ Failed' }}* → Production\n*Version:* `${{ needs.build.outputs.image_tag }}`\n*Slot:* ${{ steps.slot.outputs.deploy_slot }}\n*Actor:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ─────────────────────────────────────────────
+  # STAGE 9: Auto-Rollback
+  # ─────────────────────────────────────────────
+  rollback:
+    name: Auto-Rollback
+    runs-on: ubuntu-latest
+    needs: [deploy-prod]
+    if: failure() && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_PROD }} --region ${{ vars.AWS_REGION }}
+
+      - name: Rollback traffic
+        run: |
+          CURRENT=$(kubectl get service app -n app-prod -o jsonpath='{.spec.selector.slot}')
+          if [ "$CURRENT" = "green" ]; then PREV="blue"; else PREV="green"; fi
+          kubectl patch service app -n app-prod \
+            --type=json \
+            -p='[{"op":"replace","path":"/spec/selector/slot","value":"'"$PREV"'"}]'
+          echo "⏪ Rolled back to $PREV slot"
+
+      - name: Notify Slack (rollback)
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: '{"text":"⏪ *Auto-rollback triggered* in production. Investigate: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
